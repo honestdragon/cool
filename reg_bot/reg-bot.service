@@ -1,0 +1,22 @@
+[Unit]
+Description=Bittensor SN15 registration bot (reg_bot.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/work/oro/reg_bot
+EnvironmentFile=-/root/work/oro/reg_bot/config.env
+
+ExecStart=/root/.venv/bin/python3 /root/work/oro/reg_bot/reg_bot.py --verbose
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+StandardOutput=append:/root/work/oro/reg_bot/reg_bot.stdout.log
+StandardError=append:/root/work/oro/reg_bot/reg_bot.stdout.log
+
+[Install]
+WantedBy=multi-user.target
