@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated SQLite caches (local runtime data)
+oro/oro_race/race_agent_cache.db

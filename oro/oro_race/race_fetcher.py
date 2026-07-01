@@ -81,6 +81,24 @@ def build_hotkey_coldkey_map(hotkeys: list[str] | None = None) -> dict[str, str]
         return {}
 
 
+def fetch_hotkey_agent_names(base_url: str = DEFAULT_BASE_URL) -> dict[str, str]:
+    """Map miner hotkey -> agent_name from the current ORO race qualifiers."""
+    try:
+        data = _get_json(f"{base_url}/v1/public/races/current")
+    except Exception:
+        return {}
+
+    mapping: dict[str, str] = {}
+    for qualifier in data.get("qualifiers") or []:
+        if qualifier.get("is_discarded"):
+            continue
+        hotkey = qualifier.get("miner_hotkey")
+        name = (qualifier.get("agent_name") or "").strip()
+        if hotkey and name:
+            mapping[str(hotkey)] = name
+    return mapping
+
+
 def extract_winner_record(detail: dict) -> dict | None:
     race = detail.get("race") or {}
     race_number = race.get("race_number")

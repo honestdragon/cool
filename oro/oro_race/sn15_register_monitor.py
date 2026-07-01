@@ -16,6 +16,9 @@ from threading import Timer
 
 from flask import Flask, jsonify, render_template_string, request
 
+from coldkey_transfers import build_registration_transfer_payload
+from race_db import DEFAULT_DB
+from race_fetcher import fetch_hotkey_agent_names
 from subnet_registration import (
     fetch_registration_monitor_rows,
     fetch_to_be_removed_rows,
@@ -37,6 +40,10 @@ _cache: dict | None = None
 _cache_at: float = 0.0
 _remove_cache: dict | None = None
 _remove_cache_at: float = 0.0
+_agent_name_cache: dict[str, str] | None = None
+_agent_name_cache_at: float = 0.0
+_transfer_cache: dict | None = None
+_transfer_cache_at: float = 0.0
 
 
 def load_env() -> None:
@@ -74,6 +81,21 @@ def _mark_new_rows(rows: list[dict]) -> tuple[list[dict], int]:
         return marked, new_count
 
 
+def _get_hotkey_agent_names(*, force: bool = False, cache_seconds: float = 300.0) -> dict[str, str]:
+    global _agent_name_cache, _agent_name_cache_at
+    now = time.monotonic()
+    if not force and _agent_name_cache is not None and (now - _agent_name_cache_at) < cache_seconds:
+        return _agent_name_cache
+    _agent_name_cache = fetch_hotkey_agent_names()
+    _agent_name_cache_at = now
+    return _agent_name_cache
+
+
+def _attach_agent_names(rows: list[dict], hotkey_agent_names: dict[str, str]) -> None:
+    for row in rows:
+        row["agent_name"] = hotkey_agent_names.get(row.get("hotkey") or "")
+
+
 def _attach_remove_ranks(rows: list[dict], to_be_removed: dict) -> None:
     rank_by_uid = {
         row["uid"]: row["remove_rank"]
@@ -84,6 +106,26 @@ def _attach_remove_ranks(rows: list[dict], to_be_removed: dict) -> None:
         row["remove_rank"] = rank_by_uid.get(row["uid"])
 
 
+def _attach_transfer_groups(rows: list[dict], *, force: bool = False) -> dict:
+    global _transfer_cache, _transfer_cache_at
+    coldkeys = {row["coldkey"] for row in rows if row.get("coldkey")}
+    now = time.monotonic()
+    if not force and _transfer_cache is not None and (now - _transfer_cache_at) < 900.0:
+        transfer_meta = _transfer_cache
+    else:
+        transfer_meta = build_registration_transfer_payload(coldkeys, DEFAULT_DB, sync=force)
+        _transfer_cache = transfer_meta
+        _transfer_cache_at = now
+
+    by_coldkey = transfer_meta.get("by_coldkey") or {}
+    for row in rows:
+        meta = by_coldkey.get(row.get("coldkey") or "", {})
+        for key, value in meta.items():
+            if key.startswith("transfer_group"):
+                row[key] = value
+    return transfer_meta
+
+
 def _get_payload(*, force: bool = False, cache_seconds: float = 15.0) -> dict:
     global _cache, _cache_at
     now = time.monotonic()
@@ -92,11 +134,33 @@ def _get_payload(*, force: bool = False, cache_seconds: float = 15.0) -> dict:
 
     payload = fetch_registration_monitor_rows(max_block_lookups=50 if force else 20)
     to_be_removed = fetch_to_be_removed_rows()
+    hotkey_agent_names = _get_hotkey_agent_names(force=force)
     rows, new_count = _mark_new_rows(payload["rows"])
+    _attach_agent_names(rows, hotkey_agent_names)
     _attach_remove_ranks(rows, to_be_removed)
+    transfer_meta = _attach_transfer_groups(rows, force=force)
     payload["rows"] = rows
+    payload["agent_names"] = {
+        "source": "oro_current_race",
+        "mapped_hotkeys": len(hotkey_agent_names),
+    }
+    with_agent_name = sum(1 for row in rows if row.get("agent_name"))
+    payload["summary"]["with_agent_name"] = with_agent_name
+    payload["summary"]["unique_agent_names"] = len(
+        {row["agent_name"] for row in rows if row.get("agent_name")}
+    )
     payload["to_be_removed"] = to_be_removed
     payload["new_since_last_fetch"] = new_count
+    payload["coldkey_transfers"] = {
+        "source": transfer_meta.get("source"),
+        "source_note": transfer_meta.get("source_note"),
+        "pair_count": transfer_meta.get("pair_count", 0),
+        "linked_group_count": transfer_meta.get("linked_group_count", 0),
+        "linked_coldkey_count": transfer_meta.get("linked_coldkey_count", 0),
+        "groups": transfer_meta.get("groups") or [],
+    }
+    payload["summary"]["transfer_linked_groups"] = transfer_meta.get("linked_group_count", 0)
+    payload["summary"]["transfer_linked_coldkeys"] = transfer_meta.get("linked_coldkey_count", 0)
     _cache = payload
     _cache_at = now
     return payload
@@ -109,6 +173,9 @@ def _get_remove_payload(*, force: bool = False, cache_seconds: float = 15.0) -> 
         return _remove_cache
 
     payload = fetch_to_be_removed_rows()
+    hotkey_agent_names = _get_hotkey_agent_names(force=force)
+    _attach_agent_names(payload.get("rows") or [], hotkey_agent_names)
+    _attach_agent_names(payload.get("team_rows") or [], hotkey_agent_names)
     _remove_cache = payload
     _remove_cache_at = now
     return payload
@@ -296,6 +363,23 @@ COMMON_STYLES = """
       background: var(--panel) !important;
       border-bottom: 1px solid var(--border);
     }
+    #table-wrap .tabulator-row,
+    #table-wrap .tabulator-row .tabulator-cell {
+      height: 42px !important;
+      min-height: 42px !important;
+      max-height: 42px !important;
+    }
+    #table-wrap .tabulator-row .tabulator-cell {
+      display: inline-flex;
+      align-items: center;
+      overflow: hidden;
+    }
+    #table-wrap .agent-names-cell {
+      flex-wrap: nowrap;
+      overflow: hidden;
+      white-space: nowrap;
+      max-width: 100%;
+    }
     .tabulator-row:nth-child(even) { background: #121212 !important; }
     .tabulator-row:hover { background: var(--row-hover) !important; }
     .tabulator-row.row-new {
@@ -363,6 +447,42 @@ COMMON_STYLES = """
       background: rgba(255, 255, 255, 0.04);
       border: 1px solid rgba(180, 155, 120, 0.28);
     }
+    .transfer-group-name {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 500;
+      font-size: 12px;
+      color: #c4b5fd;
+      background: rgba(196, 181, 253, 0.12);
+      border: 1px solid rgba(196, 181, 253, 0.28);
+    }
+    .agent-name {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 500;
+      font-size: 12px;
+    }
+    .agent-name-current {
+      color: #a5f3fc;
+      background: rgba(8, 145, 178, 0.22);
+      border: 1px solid rgba(8, 145, 178, 0.55);
+      font-weight: 600;
+      box-shadow: 0 0 0 1px rgba(8, 145, 178, 0.12);
+    }
+    .agent-name-other {
+      color: #64748b;
+      background: rgba(100, 116, 139, 0.1);
+      border: 1px solid rgba(100, 116, 139, 0.22);
+    }
+    .agent-names-cell {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+      line-height: 1.5;
+    }
     .view-toggle {
       display: inline-flex;
       border: 1px solid var(--border);
@@ -400,6 +520,45 @@ COMMON_STYLES = """
       display: inline-block;
     }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .key-copy-cell {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 100%;
+    }
+    .key-copy-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .key-copy-btn {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .key-copy-btn:hover {
+      color: var(--text);
+      border-color: var(--accent);
+    }
+    .key-copy-btn.copied {
+      color: #4ade80;
+      border-color: #22c55e;
+    }
+    .key-copy-icon {
+      width: 14px;
+      height: 14px;
+      display: block;
+      pointer-events: none;
+    }
     .status-dot {
       display: inline-block;
       width: 8px;
@@ -456,6 +615,84 @@ LOCAL_TIME_JS = """
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
+      });
+    }
+
+    function formatRegisteredAt(value) {
+      const dt = parseRegisteredAt(value);
+      if (!dt) return value ? String(value) : "-";
+      return dt.toLocaleString(undefined, {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function shortKey(value) {
+      if (!value) return "-";
+      if (value.length <= 16) return value;
+      return value.slice(0, 8) + "…" + value.slice(-6);
+    }
+
+    async function copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (_) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+          return true;
+        } catch (_) {
+          return false;
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+    }
+
+    const KEY_COPY_ICON = '<svg class="key-copy-icon" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M4 1.5h7A1.5 1.5 0 0 1 12.5 3v8h1V3a2.5 2.5 0 0 0-2.5-2.5H4A2.5 2.5 0 0 0 1.5 3v9A2.5 2.5 0 0 0 4 14.5h6v-1H4A1.5 1.5 0 0 1 2.5 12V3A1.5 1.5 0 0 1 4 1.5zm2 3A1.5 1.5 0 0 0 4.5 6v7A1.5 1.5 0 0 0 6 14.5h6A1.5 1.5 0 0 0 13.5 13V6A1.5 1.5 0 0 0 12 4.5H6zm0 1h6a.5.5 0 0 1 .5.5v7a.5.5 0 0 1-.5.5H6a.5.5 0 0 1-.5-.5V6a.5.5 0 0 1 .5-.5z"/></svg>';
+    const KEY_COPIED_ICON = '<svg class="key-copy-icon" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.2 11.8 3.4 9l.85-.85L6.2 10.1l5.55-5.55.85.85L6.2 11.8z"/></svg>';
+
+    function keyCopyFormatter(cell) {
+      const value = cell.getValue();
+      if (!value) return "-";
+      const escaped = escapeHtml(value);
+      return `<span class="key-copy-cell"><span class="mono key-copy-text" title="${escaped}">${escapeHtml(shortKey(value))}</span><button type="button" class="key-copy-btn" data-copy="${escaped}" title="Copy full key" aria-label="Copy full key">${KEY_COPY_ICON}</button></span>`;
+    }
+
+    if (!window.__sn15KeyCopyBound) {
+      window.__sn15KeyCopyBound = true;
+      document.addEventListener("click", async (event) => {
+        const btn = event.target.closest(".key-copy-btn");
+        if (!btn) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const text = btn.getAttribute("data-copy") || "";
+        if (!text) return;
+        const ok = await copyText(text);
+        if (!ok) return;
+        btn.innerHTML = KEY_COPIED_ICON;
+        btn.classList.add("copied");
+        window.setTimeout(() => {
+          btn.innerHTML = KEY_COPY_ICON;
+          btn.classList.remove("copied");
+        }, 1200);
       });
     }
 
@@ -625,13 +862,14 @@ HTML = """
     <div class="view-toggle" role="group" aria-label="View mode">
       <button type="button" class="active" id="view-uid" data-view="uid">By UID</button>
       <button type="button" id="view-coldkey" data-view="coldkey">By coldkey</button>
+      <button type="button" id="view-transfer-group" data-view="transfer-group">By xfer group</button>
     </div>
     <label>
       Auto refresh
       <select id="refresh-interval">
         <option value="15">15s</option>
-        <option value="30" selected>30s</option>
-        <option value="60">60s</option>
+        <option value="30">30s</option>
+        <option value="60" selected>60s</option>
         <option value="120">2m</option>
         <option value="0">Off</option>
       </select>
@@ -647,7 +885,9 @@ HTML = """
     <span>Coldkeys: <strong id="stat-coldkeys">-</strong></span>
     <span>Multi-UID coldkeys: <strong id="stat-multi">-</strong></span>
     <span>Max UIDs/coldkey: <strong id="stat-max-uid">-</strong></span>
-    <span>Subnet daily TAO: <strong id="stat-daily-tao">-</strong> <span class="validator-tag">miners only</span></span>
+    <span>With agent name: <strong id="stat-agent-names">-</strong></span>
+    <span>Xfer groups: <strong id="stat-transfer-groups">-</strong></span>
+    <span>Subnet daily TAO: <strong id="stat-daily-tao">-</strong> <span class="validator-tag">miners</span></span>
     <span class="team-daily-stat">Group daily TAO: <strong id="stat-team-daily-tao">-</strong></span>
     <span title="All registrations in the last 24 hours">24h reg spend: <strong id="stat-today-reg-spend">-</strong></span>
     <span class="team-reg-stat" title="Group registrations in the last 24 hours">Group 24h reg: <strong id="stat-team-today-reg">-</strong></span>
@@ -692,15 +932,72 @@ HTML = """
       ).join(" · ");
     }
 
-    function shortKey(value) {
-      if (!value) return "-";
-      if (value.length <= 16) return value;
-      return value.slice(0, 8) + "…" + value.slice(-6);
-    }
-
     function teamNameFormatter(cell) {
       const value = cell.getValue();
       return value ? `<span class="team-name">${value}</span>` : "-";
+    }
+
+    function transferGroupFormatter(cell) {
+      const row = cell.getRow().getData();
+      const label = cell.getValue() || row.transfer_group_label;
+      if (!label) return "-";
+      const size = row.transfer_group_size || 0;
+      const title = (row.transfer_group_coldkeys || []).join("\\n");
+      return `<span class="transfer-group-name" title="${escapeHtml(title)}">${escapeHtml(label)}${size > 1 ? ` (${size})` : ""}</span>`;
+    }
+
+    function agentNameFormatter(cell) {
+      const value = cell.getValue();
+      return value ? `<span class="agent-name agent-name-current">${escapeHtml(value)}</span>` : "-";
+    }
+
+    function allAgentsFormatter(cell) {
+      const names = cell.getValue() || [];
+      if (!names.length) return "-";
+      return `<span class="agent-names-cell">${names.map((name) =>
+        `<span class="agent-name agent-name-current">${escapeHtml(name)}</span>`
+      ).join("")}</span>`;
+    }
+
+    function buildColdkeyAgentIndex(rows) {
+      const byColdkey = new Map();
+      for (const row of rows || []) {
+        const coldkey = row.coldkey || "";
+        if (!byColdkey.has(coldkey)) {
+          byColdkey.set(coldkey, new Set());
+        }
+        if (row.agent_name) {
+          byColdkey.get(coldkey).add(row.agent_name);
+        }
+      }
+      return byColdkey;
+    }
+
+    function enrichUidRows(rows) {
+      const index = buildColdkeyAgentIndex(rows);
+      return (rows || []).map((row) => {
+        const names = index.get(row.coldkey || "");
+        const coldkey_agent_names = names
+          ? [...names].sort((a, b) => a.localeCompare(b))
+          : (row.agent_name ? [row.agent_name] : []);
+        return { ...row, coldkey_agent_names };
+      });
+    }
+
+    function uidAgentFormatter(cell) {
+      const row = cell.getRow().getData();
+      const names = row.coldkey_agent_names || [];
+      const current = row.agent_name || null;
+      if (!names.length) return "-";
+      return `<span class="agent-names-cell">${names.map((name) => {
+        const cls = name === current ? "agent-name agent-name-current" : "agent-name agent-name-other";
+        const title = name === current ? "This hotkey's agent" : "Other agent on same coldkey";
+        return `<span class="${cls}" title="${title}">${escapeHtml(name)}</span>`;
+      }).join("")}</span>`;
+    }
+
+    function minerTableRows(rows) {
+      return (rows || []).filter((row) => !row.is_validator);
     }
 
     function formatRowElement(row) {
@@ -708,7 +1005,6 @@ HTML = """
       const data = row.getData();
       el.classList.toggle("row-new", viewMode === "uid" && knownNewHotkeys.has(data.hotkey));
       el.classList.toggle("row-team", !!data.is_team);
-      el.classList.toggle("row-validator", viewMode === "uid" && !!data.is_validator);
     }
 
     function buildColdkeyGroups(rows) {
@@ -720,19 +1016,24 @@ HTML = """
             coldkey,
             team_name: row.team_name || null,
             is_team: !!row.is_team,
-            coldkey_uid_count: row.coldkey_uid_count || 0,
             coldkey_total_reg_cost_tao: row.coldkey_total_reg_cost_tao,
-            coldkey_total_emission: row.coldkey_total_emission,
-            coldkey_daily_tao: row.coldkey_daily_tao,
             uids: [],
             latest_registered_at: null,
             earliest_registered_at: null,
             latest_registered_ts: null,
             earliest_registered_ts: null,
+            agent_names: new Set(),
+            coldkey_total_emission: 0,
+            coldkey_daily_tao: 0,
           });
         }
         const group = groups.get(coldkey);
         group.uids.push(row.uid);
+        group.coldkey_total_emission += Number(row.emission || 0);
+        group.coldkey_daily_tao += Number(row.daily_tao || 0);
+        if (row.agent_name) {
+          group.agent_names.add(row.agent_name);
+        }
         const registeredAt = parseRegisteredAt(row.registered_at);
         if (registeredAt) {
           const ts = registeredAt.getTime();
@@ -750,8 +1051,16 @@ HTML = """
         .map((group) => {
           group.uids.sort((a, b) => a - b);
           group.uid_list = group.uids.join(", ");
-          group.earliest_registered_at = formatLocalDateTime(group.earliest_registered_at);
-          group.latest_registered_at = formatLocalDateTime(group.latest_registered_at);
+          group.coldkey_uid_count = group.uids.length;
+          group.coldkey_total_emission = Math.round(group.coldkey_total_emission * 1e6) / 1e6;
+          group.coldkey_daily_tao = Math.round(group.coldkey_daily_tao * 1e6) / 1e6;
+          group.agent_names_list = [...group.agent_names].sort((a, b) => a.localeCompare(b));
+          group.agent_names_display = group.agent_names_list.length
+            ? group.agent_names_list.join(", ")
+            : null;
+          delete group.agent_names;
+          group.earliest_registered_at = formatRegisteredAt(group.earliest_registered_at);
+          group.latest_registered_at = formatRegisteredAt(group.latest_registered_at);
           delete group.latest_registered_ts;
           delete group.earliest_registered_ts;
           return group;
@@ -763,48 +1072,98 @@ HTML = """
         });
     }
 
+    function buildTransferGroupRows(rows) {
+      const groups = new Map();
+      for (const row of rows || []) {
+        const groupId = row.transfer_group_id;
+        if (!groupId || (row.transfer_group_size || 0) < 2) continue;
+        if (!groups.has(groupId)) {
+          groups.set(groupId, {
+            transfer_group_id: groupId,
+            transfer_group_label: row.transfer_group_label,
+            transfer_group_size: row.transfer_group_size || 0,
+            transfer_group_transfer_count: row.transfer_group_transfer_count || 0,
+            transfer_group_coldkeys: row.transfer_group_coldkeys || [],
+            coldkeys_display: (row.transfer_group_coldkeys || []).map((key) => shortKey(key)).join(", "),
+            team_names: new Set(),
+            agent_names: new Set(),
+            uids: [],
+            coldkey_daily_tao: 0,
+            coldkey_total_emission: 0,
+            is_team: false,
+          });
+        }
+        const group = groups.get(groupId);
+        group.uids.push(row.uid);
+        group.coldkey_daily_tao += Number(row.daily_tao || 0);
+        group.coldkey_total_emission += Number(row.emission || 0);
+        if (row.team_name) {
+          group.team_names.add(row.team_name);
+          group.is_team = true;
+        }
+        if (row.agent_name) group.agent_names.add(row.agent_name);
+      }
+      return Array.from(groups.values())
+        .map((group) => {
+          group.uid_count = group.uids.length;
+          group.uid_list = group.uids.sort((a, b) => a - b).join(", ");
+          group.team_names_list = [...group.team_names].sort((a, b) => a.localeCompare(b));
+          group.team_name = group.team_names_list.join(", ") || null;
+          group.agent_names_list = [...group.agent_names].sort((a, b) => a.localeCompare(b));
+          group.agent_names_display = group.agent_names_list.join(", ") || null;
+          group.coldkey_daily_tao = Math.round(group.coldkey_daily_tao * 1e6) / 1e6;
+          group.coldkey_total_emission = Math.round(group.coldkey_total_emission * 1e6) / 1e6;
+          delete group.team_names;
+          delete group.agent_names;
+          delete group.uids;
+          return group;
+        })
+        .sort((a, b) =>
+          (b.transfer_group_transfer_count || 0) - (a.transfer_group_transfer_count || 0)
+          || (b.coldkey_daily_tao || 0) - (a.coldkey_daily_tao || 0)
+          || String(a.transfer_group_label).localeCompare(String(b.transfer_group_label))
+        );
+    }
+
     const uidColumns = [
-      { title: "UID", field: "uid", width: 70, sorter: "number", hozAlign: "right",
-        formatter: (cell) => {
-          const data = cell.getRow().getData();
-          const uid = cell.getValue();
-          return data.is_validator ? `${uid}<span class="validator-tag">V</span>` : String(uid);
-        },
-      },
-      {
-        title: "Remove #",
-        field: "remove_rank",
-        width: 85,
-        hozAlign: "right",
-        sorter: "number",
-        formatter: (cell) => {
-          const value = cell.getValue();
-          return value == null || value === "" ? "-" : String(value);
-        },
-      },
+      { title: "UID", field: "uid", width: 70, sorter: "number", hozAlign: "right" },
       { title: "Name", field: "team_name", width: 100, formatter: teamNameFormatter },
+      {
+        title: "Agent",
+        field: "coldkey_agent_names",
+        minWidth: 180,
+        formatter: uidAgentFormatter,
+      },
       {
         title: "Hotkey",
         field: "hotkey",
         minWidth: 150,
-        formatter: (cell) => `<span class="mono" title="${cell.getValue()}">${shortKey(cell.getValue())}</span>`,
+        formatter: keyCopyFormatter,
       },
       {
         title: "Coldkey",
         field: "coldkey",
         minWidth: 150,
-        formatter: (cell) => `<span class="mono" title="${cell.getValue()}">${shortKey(cell.getValue())}</span>`,
+        formatter: keyCopyFormatter,
       },
       {
         title: "Registered",
         field: "registered_at",
         minWidth: 170,
         sorter: (a, b) => compareRegisteredAt(a, b),
-        formatter: (cell) => formatLocalDateTime(cell.getValue()),
+        formatter: (cell) => formatRegisteredAt(cell.getValue()),
       },
       {
         title: "Reg cost (τ)",
         field: "registration_cost_tao",
+        width: 110,
+        hozAlign: "right",
+        sorter: "number",
+        formatter: (cell) => fmtTao(cell.getValue()),
+      },
+      {
+        title: "Daily TAO (τ)",
+        field: "daily_tao",
         width: 110,
         hozAlign: "right",
         sorter: "number",
@@ -830,10 +1189,16 @@ HTML = """
     const coldkeyColumns = [
       { title: "Name", field: "team_name", width: 110, formatter: teamNameFormatter },
       {
+        title: "Agents",
+        field: "agent_names_list",
+        minWidth: 160,
+        formatter: allAgentsFormatter,
+      },
+      {
         title: "Coldkey",
         field: "coldkey",
         minWidth: 160,
-        formatter: (cell) => `<span class="mono" title="${cell.getValue()}">${shortKey(cell.getValue())}</span>`,
+        formatter: keyCopyFormatter,
       },
       {
         title: "UIDs",
@@ -886,6 +1251,63 @@ HTML = """
       },
     ];
 
+    const transferGroupColumns = [
+      {
+        title: "Group",
+        field: "transfer_group_label",
+        width: 90,
+        formatter: transferGroupFormatter,
+      },
+      {
+        title: "Transfers",
+        field: "transfer_group_transfer_count",
+        width: 85,
+        hozAlign: "right",
+        sorter: "number",
+      },
+      {
+        title: "Coldkeys",
+        field: "transfer_group_size",
+        width: 75,
+        hozAlign: "right",
+        sorter: "number",
+      },
+      { title: "Names", field: "team_name", minWidth: 110, formatter: teamNameFormatter },
+      {
+        title: "Agents",
+        field: "agent_names_list",
+        minWidth: 160,
+        formatter: allAgentsFormatter,
+      },
+      {
+        title: "Coldkey list",
+        field: "coldkeys_display",
+        minWidth: 260,
+        formatter: (cell) => `<span class="uid-list" title="${cell.getValue() || ""}">${cell.getValue() || "-"}</span>`,
+      },
+      {
+        title: "UIDs",
+        field: "uid_count",
+        width: 70,
+        hozAlign: "right",
+        sorter: "number",
+      },
+      {
+        title: "Daily TAO (τ)",
+        field: "coldkey_daily_tao",
+        width: 120,
+        hozAlign: "right",
+        sorter: "number",
+        formatter: (cell) => fmtTao(cell.getValue()),
+      },
+      {
+        title: "UID list",
+        field: "uid_list",
+        minWidth: 220,
+        formatter: (cell) => `<span class="uid-list" title="${cell.getValue() || ""}">${cell.getValue() || "-"}</span>`,
+      },
+    ];
+
     function destroyMainTable() {
       if (table) {
         table.destroy();
@@ -896,17 +1318,30 @@ HTML = """
     function renderTable(rows) {
       lastRows = rows || [];
       destroyMainTable();
-      const data = viewMode === "coldkey" ? buildColdkeyGroups(lastRows) : lastRows;
-      const columns = viewMode === "coldkey" ? coldkeyColumns : uidColumns;
-      const initialSort = viewMode === "coldkey"
-        ? [{ column: "coldkey_daily_tao", dir: "desc" }]
-        : [{ column: "registered_at", dir: "desc", sorter: (a, b) => compareRegisteredAt(a, b) }];
+      const visibleRows = minerTableRows(lastRows);
+      let data;
+      let columns;
+      let initialSort;
+      if (viewMode === "transfer-group") {
+        data = buildTransferGroupRows(visibleRows);
+        columns = transferGroupColumns;
+        initialSort = [{ column: "transfer_group_transfer_count", dir: "desc" }];
+      } else if (viewMode === "coldkey") {
+        data = buildColdkeyGroups(visibleRows);
+        columns = coldkeyColumns;
+        initialSort = [{ column: "coldkey_daily_tao", dir: "desc" }];
+      } else {
+        data = enrichUidRows(visibleRows);
+        columns = uidColumns;
+        initialSort = [{ column: "registered_at", dir: "desc", sorter: (a, b) => compareRegisteredAt(a, b) }];
+      }
 
       table = new Tabulator("#table-wrap", {
         data,
         columns,
         layout: "fitDataStretch",
         height: "calc(100vh - 210px)",
+        rowHeight: 42,
         placeholder: "No registrations loaded",
         initialSort,
         rowFormatter: formatRowElement,
@@ -924,17 +1359,27 @@ HTML = """
       table.setFilter((data) => {
         if (teamOnly && !data.is_team) return false;
         if (!q) return true;
+        if (viewMode === "transfer-group") {
+          return (data.transfer_group_label || "").toLowerCase().includes(q)
+            || (data.coldkeys_display || "").toLowerCase().includes(q)
+            || (data.team_name || "").toLowerCase().includes(q)
+            || (data.agent_names_display || "").toLowerCase().includes(q)
+            || String(data.uid_count || "").includes(q)
+            || (data.uid_list || "").includes(q);
+        }
         if (viewMode === "coldkey") {
           return (data.team_name || "").toLowerCase().includes(q)
             || (data.coldkey || "").toLowerCase().includes(q)
+            || (data.agent_names_display || "").toLowerCase().includes(q)
             || String(data.coldkey_uid_count || "").includes(q)
             || (data.uid_list || "").includes(q);
         }
         return String(data.uid).includes(q)
           || (data.team_name || "").toLowerCase().includes(q)
+          || (data.agent_name || "").toLowerCase().includes(q)
+          || (data.coldkey_agent_names || []).some((name) => name.toLowerCase().includes(q))
           || (data.hotkey || "").toLowerCase().includes(q)
-          || (data.coldkey || "").toLowerCase().includes(q)
-          || String(data.remove_rank ?? "").includes(q);
+          || (data.coldkey || "").toLowerCase().includes(q);
       });
     }
 
@@ -942,6 +1387,7 @@ HTML = """
       viewMode = mode;
       document.getElementById("view-uid").classList.toggle("active", mode === "uid");
       document.getElementById("view-coldkey").classList.toggle("active", mode === "coldkey");
+      document.getElementById("view-transfer-group").classList.toggle("active", mode === "transfer-group");
       renderTable(lastRows);
     }
 
@@ -955,11 +1401,15 @@ HTML = """
       document.getElementById("stat-coldkeys").textContent = s.unique_coldkeys ?? "-";
       document.getElementById("stat-multi").textContent = s.multi_uid_coldkeys ?? "-";
       document.getElementById("stat-max-uid").textContent = s.max_coldkey_uid_count ?? "-";
+      document.getElementById("stat-agent-names").textContent =
+        s.with_agent_name != null
+          ? `${s.with_agent_name}/${s.registered_count || 0} (${s.unique_agent_names || 0} unique)`
+          : "-";
       document.getElementById("stat-daily-tao").textContent =
-        s.total_daily_tao != null ? `${fmtTao(s.total_daily_tao)}/day` : "-";
+        s.miner_daily_tao != null ? `${fmtTao(s.miner_daily_tao)}/day` : "-";
       document.getElementById("stat-team-daily-tao").textContent =
         s.team_daily_tao != null
-          ? `${fmtTao(s.team_daily_tao)}/day (${s.team_daily_tao_pct || 0}%)`
+          ? `${fmtTao(s.team_daily_tao)}/day (${s.team_daily_tao_pct || 0}% of miners)`
           : "-";
       document.getElementById("stat-today-reg-spend").textContent =
         `${fmtTao(rolling24.total_tao)} τ (${rolling24.registrations} UID${rolling24.registrations === 1 ? "" : "s"})`;
@@ -973,6 +1423,10 @@ HTML = """
         `${s.known_registration_times || 0}/${s.registered_count || 0}`;
       document.getElementById("stat-team").textContent =
         `${s.team_uids || 0} UIDs / ${s.team_registered_members || 0}/${s.team_members || 0} members`;
+      document.getElementById("stat-transfer-groups").textContent =
+        s.transfer_linked_groups != null
+          ? `${s.transfer_linked_groups} (${s.transfer_linked_coldkeys || 0} coldkeys)`
+          : "-";
 
       document.getElementById("stat-team-risk").textContent = removeSummary.team_at_risk ?? 0;
       document.getElementById("stat-team-rank").textContent =
@@ -1022,10 +1476,11 @@ HTML = """
       const costs = payload.registration_costs || {};
       const times = payload.registration_times || {};
       const emission = payload.emission || {};
+      const xfer = payload.coldkey_transfers || {};
       const notes = [times.note, costs.note].filter(Boolean);
-      if (emission.miners_only) {
-        const validators = payload.summary?.validator_count ?? emission.validator_count ?? 0;
-        notes.push(`Emission/daily TAO excludes ${validators} validator UID(s).`);
+      if (xfer.source_note) notes.push(xfer.source_note);
+      if (emission.validator_count) {
+        notes.push(`${emission.validator_count} subnet validator UID(s) hidden from the table.`);
       }
       document.getElementById("cost-note").textContent = notes.join(" | ");
     }
@@ -1074,6 +1529,7 @@ HTML = """
     });
     document.getElementById("view-uid").addEventListener("click", () => setViewMode("uid"));
     document.getElementById("view-coldkey").addEventListener("click", () => setViewMode("coldkey"));
+    document.getElementById("view-transfer-group").addEventListener("click", () => setViewMode("transfer-group"));
     document.getElementById("refresh-interval").addEventListener("change", scheduleRefresh);
     document.getElementById("reset-new-btn").addEventListener("click", () => {
       knownNewHotkeys.clear();
@@ -1115,8 +1571,8 @@ HTML_REMOVE = """
       Auto refresh
       <select id="refresh-interval">
         <option value="15">15s</option>
-        <option value="30" selected>30s</option>
-        <option value="60">60s</option>
+        <option value="30">30s</option>
+        <option value="60" selected>60s</option>
         <option value="120">2m</option>
         <option value="0">Off</option>
       </select>
@@ -1156,12 +1612,6 @@ HTML_REMOVE = """
       ).join(" · ");
     }
 
-    function shortKey(value) {
-      if (!value) return "-";
-      if (value.length <= 16) return value;
-      return value.slice(0, 8) + "…" + value.slice(-6);
-    }
-
     function teamNameFormatter(cell) {
       const value = cell.getValue();
       return value ? `<span class="team-name">${value}</span>` : "-";
@@ -1172,23 +1622,32 @@ HTML_REMOVE = """
       { title: "UID", field: "uid", width: 70, hozAlign: "right", sorter: "number" },
       { title: "Name", field: "team_name", width: 100, formatter: teamNameFormatter },
       {
+        title: "Agent",
+        field: "agent_name",
+        minWidth: 120,
+        formatter: (cell) => {
+          const value = cell.getValue();
+          return value ? `<span class="agent-name">${value}</span>` : "-";
+        },
+      },
+      {
         title: "Hotkey",
         field: "hotkey",
         minWidth: 150,
-        formatter: (cell) => `<span class="mono" title="${cell.getValue()}">${shortKey(cell.getValue())}</span>`,
+        formatter: keyCopyFormatter,
       },
       {
         title: "Coldkey",
         field: "coldkey",
         minWidth: 150,
-        formatter: (cell) => `<span class="mono" title="${cell.getValue()}">${shortKey(cell.getValue())}</span>`,
+        formatter: keyCopyFormatter,
       },
       {
         title: "Registered",
         field: "registered_at",
         minWidth: 170,
         sorter: (a, b) => compareRegisteredAt(a, b),
-        formatter: (cell) => formatLocalDateTime(cell.getValue()),
+        formatter: (cell) => formatRegisteredAt(cell.getValue()),
       },
       {
         title: "Reg cost (τ)",
@@ -1225,6 +1684,7 @@ HTML_REMOVE = """
       table.setFilter((data) =>
         String(data.uid).includes(q)
           || (data.team_name || "").toLowerCase().includes(q)
+          || (data.agent_name || "").toLowerCase().includes(q)
           || (data.hotkey || "").toLowerCase().includes(q)
           || (data.coldkey || "").toLowerCase().includes(q)
           || String(data.remove_rank ?? "").includes(q)
@@ -1330,8 +1790,8 @@ HTML_REG_SPEND = """
       Auto refresh
       <select id="refresh-interval">
         <option value="15">15s</option>
-        <option value="30" selected>30s</option>
-        <option value="60">60s</option>
+        <option value="30">30s</option>
+        <option value="60" selected>60s</option>
         <option value="120">2m</option>
         <option value="0">Off</option>
       </select>
@@ -1559,8 +2019,8 @@ HTML_MEMBER_DAILY = """
       Auto refresh
       <select id="refresh-interval">
         <option value="15">15s</option>
-        <option value="30" selected>30s</option>
-        <option value="60">60s</option>
+        <option value="30">30s</option>
+        <option value="60" selected>60s</option>
         <option value="120">2m</option>
         <option value="0">Off</option>
       </select>
@@ -1614,6 +2074,7 @@ HTML_MEMBER_DAILY = """
       const byColdkey = Object.fromEntries(members.map((member) => [member.coldkey, member]));
 
       for (const row of rows || []) {
+        if (row.is_validator) continue;
         const member = byColdkey[row.coldkey];
         if (!member) continue;
         member.uids.push({
@@ -1622,6 +2083,7 @@ HTML_MEMBER_DAILY = """
           reg_cost: row.registration_cost_tao,
           daily_tao: Number(row.daily_tao || 0),
           is_validator: !!row.is_validator,
+          is_miner: !!row.is_miner,
         });
       }
 
@@ -1648,7 +2110,7 @@ HTML_MEMBER_DAILY = """
           );
           const alive_uid_count = alive.length;
           const daily_tao = alive
-            .filter((uidRow) => !uidRow.is_validator)
+            .filter((uidRow) => uidRow.is_miner)
             .reduce((sum, uidRow) => sum + uidRow.daily_tao, 0);
 
           if (date !== todayDate && daily_reg_count === 0 && alive_uid_count === 0) continue;
@@ -1713,11 +2175,7 @@ HTML_MEMBER_DAILY = """
         title: "Coldkey",
         field: "coldkey",
         minWidth: 150,
-        formatter: (cell) => {
-          const value = cell.getValue() || "";
-          const short = value.length > 16 ? value.slice(0, 8) + "…" + value.slice(-6) : value;
-          return `<span class="mono" title="${value}">${short || "-"}</span>`;
-        },
+        formatter: keyCopyFormatter,
       },
     ];
 
@@ -1828,8 +2286,10 @@ HTML_MEMBER_DAILY = """
         : `Summary uses today (${todayDate}) when all dates are shown${memberFilter ? ` · ${memberFilter}` : ""}.`;
       const notes = [
         summaryHint,
-        `Daily TAO uses current miner emission rates (validators excluded). Alive UIDs = cumulative registrations through the selected day.`,
-        emission.miners_only ? "Emission excludes validators." : "",
+        `Daily TAO uses metagraph emission for UIDs with miner incentive > 0. Alive UIDs = cumulative registrations through the selected day.`,
+        emission.miner_count != null
+          ? `Miner/day total uses ${emission.miner_count} UID(s) with incentive > 0.`
+          : "",
       ].filter(Boolean);
       document.getElementById("member-note").textContent = notes.join(" ");
     }

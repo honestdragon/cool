@@ -182,6 +182,8 @@ def _build_hotkey_rows(coldkey_rows: list[dict], team_coldkey_to_name: dict[str,
                     "registration_block": miner.get("registration_block"),
                     "emission": miner.get("emission"),
                     "daily_tao": miner.get("daily_tao"),
+                    "is_validator": miner.get("is_validator"),
+                    "is_miner": miner.get("is_miner"),
                     "stake": miner.get("stake"),
                     "active": miner.get("active"),
                 }
@@ -240,17 +242,24 @@ def _emission_to_daily_tao(emission: float, *, tempo: int, alpha_price_tao: floa
     return round(float(emission) * _tempos_per_day(tempo) * float(alpha_price_tao), 6)
 
 
-def _is_validator_uid(metagraph, uid: int) -> bool:
-    """True when the UID holds validator permit (exclude from miner emission stats)."""
+def _has_validator_permit(metagraph, uid: int) -> bool:
     permits = getattr(metagraph, "validator_permit", None)
     if permits is None or uid >= len(permits):
         return False
     return bool(permits[uid])
 
 
+def _is_miner_uid(metagraph, uid: int) -> bool:
+    """True when the UID earns miner incentive (used for miner/day totals)."""
+    return float(metagraph.incentive[uid]) > 0
+
+
+def _is_validator_uid(metagraph, uid: int) -> bool:
+    """True for subnet validator UIDs (permit holder with no miner incentive)."""
+    return _has_validator_permit(metagraph, uid) and not _is_miner_uid(metagraph, uid)
+
+
 def _miner_emission(metagraph, uid: int) -> float:
-    if _is_validator_uid(metagraph, uid):
-        return 0.0
     return float(metagraph.emission[uid])
 
 
@@ -411,6 +420,7 @@ def fetch_subnet_registration_stats(
                 "stake": round(float(metagraph.stake[uid]), 6),
                 "incentive": round(float(metagraph.incentive[uid]), 6),
                 "is_validator": _is_validator_uid(metagraph, uid),
+                "is_miner": _is_miner_uid(metagraph, uid),
                 "emission": round(_miner_emission(metagraph, uid), 6),
                 "daily_tao": _emission_to_daily_tao(
                     _miner_emission(metagraph, uid),
@@ -427,6 +437,11 @@ def fetch_subnet_registration_stats(
     total_daily_tao = sum(
         _emission_to_daily_tao(_miner_emission(metagraph, uid), tempo=tempo, alpha_price_tao=alpha_price_tao)
         for uid in range(metagraph.n)
+    )
+    miner_daily_tao = sum(
+        _emission_to_daily_tao(_miner_emission(metagraph, uid), tempo=tempo, alpha_price_tao=alpha_price_tao)
+        for uid in range(metagraph.n)
+        if _is_miner_uid(metagraph, uid)
     )
     total_stake = sum(float(metagraph.stake[uid]) for uid in range(metagraph.n))
     total_incentive = sum(float(metagraph.incentive[uid]) for uid in range(metagraph.n))
@@ -542,7 +557,13 @@ def fetch_subnet_registration_stats(
     team_uids = sum(row["uid_count"] for row in team_status)
     team_emission_pct = round(sum(row["emission_pct"] for row in team_status), 3)
     team_daily_tao = round(sum(row["daily_tao"] for row in team_status), 6)
-    team_daily_tao_pct = round(100 * team_daily_tao / total_daily_tao, 3) if total_daily_tao else 0.0
+    team_miner_daily_tao = round(
+        sum(row["daily_tao"] for row in team_hotkey_rows if row.get("is_miner")),
+        6,
+    )
+    team_daily_tao_pct = (
+        round(100 * team_daily_tao / miner_daily_tao, 3) if miner_daily_tao else 0.0
+    )
     team_stake_pct = round(sum(row["stake_pct"] for row in team_status), 3)
     team_uid_pct = round(100 * team_uids / total_slots, 2) if total_slots else 0.0
     team_reg_costs = [
@@ -578,7 +599,7 @@ def fetch_subnet_registration_stats(
             "total_emission": round(total_emission, 6),
             "total_daily_tao": round(total_daily_tao, 6),
             "validator_count": validator_count,
-            "miners_only_emission": True,
+            "miners_only_emission": False,
             "alpha_price_tao": round(alpha_price_tao, 9),
             "tempo": tempo,
             "tempos_per_day": round(tempos_per_day, 2),
@@ -642,7 +663,7 @@ def _attach_coldkey_reg_totals(rows: list[dict]) -> None:
 
 
 def _attach_emission_fields(rows: list[dict], subtensor, netuid: int) -> dict:
-    """Attach per-UID and per-coldkey miner emission / daily TAO (validators excluded)."""
+    """Attach per-UID and per-coldkey emission / daily TAO."""
     metagraph = subtensor.metagraph(netuid=netuid, lite=True)
     subnet_info = subtensor.subnet(netuid=netuid)
     tempo = int(subnet_info.tempo or 360)
@@ -651,9 +672,12 @@ def _attach_emission_fields(rows: list[dict], subtensor, netuid: int) -> dict:
     uid_emission: dict[int, float] = {}
     uid_daily_tao: dict[int, float] = {}
     uid_is_validator: dict[int, bool] = {}
+    uid_is_miner: dict[int, bool] = {}
     for uid in range(metagraph.n):
         is_validator = _is_validator_uid(metagraph, uid)
+        is_miner = _is_miner_uid(metagraph, uid)
         uid_is_validator[uid] = is_validator
+        uid_is_miner[uid] = is_miner
         emission = _miner_emission(metagraph, uid)
         uid_emission[uid] = round(emission, 6)
         uid_daily_tao[uid] = _emission_to_daily_tao(
@@ -670,13 +694,13 @@ def _attach_emission_fields(rows: list[dict], subtensor, netuid: int) -> dict:
             continue
         uid = int(uid)
         is_validator = uid_is_validator.get(uid, False)
+        is_miner = uid_is_miner.get(uid, False)
         emission = uid_emission.get(uid, 0.0)
         daily_tao = uid_daily_tao.get(uid, 0.0)
         row["is_validator"] = is_validator
+        row["is_miner"] = is_miner
         row["emission"] = emission
         row["daily_tao"] = daily_tao
-        if is_validator:
-            continue
         coldkey = (row.get("coldkey") or "").strip()
         if coldkey:
             coldkey_emission[coldkey] += emission
@@ -692,13 +716,19 @@ def _attach_emission_fields(rows: list[dict], subtensor, netuid: int) -> dict:
             row["coldkey_daily_tao"] = None
 
     validator_count = sum(1 for value in uid_is_validator.values() if value)
+    miner_count = sum(1 for value in uid_is_miner.values() if value)
     total_emission = sum(uid_emission.values())
     total_daily_tao = sum(uid_daily_tao.values())
+    miner_daily_tao = sum(
+        daily for uid, daily in uid_daily_tao.items() if uid_is_miner.get(uid, False)
+    )
     return {
         "total_emission": round(total_emission, 6),
         "total_daily_tao": round(total_daily_tao, 6),
+        "miner_daily_tao": round(miner_daily_tao, 6),
         "validator_count": validator_count,
-        "miners_only": True,
+        "miner_count": miner_count,
+        "miners_only": False,
         "tempo": tempo,
         "tempos_per_day": round(_tempos_per_day(tempo), 2),
         "alpha_price_tao": round(alpha_price_tao, 9),
@@ -1211,7 +1241,10 @@ def fetch_registration_monitor_rows(
     team_total_emission = round(sum(row.get("emission") or 0 for row in team_rows), 6)
     team_daily_tao = round(sum(row.get("daily_tao") or 0 for row in team_rows), 6)
     total_daily_tao = emission_meta["total_daily_tao"]
-    team_daily_tao_pct = round(100 * team_daily_tao / total_daily_tao, 2) if total_daily_tao else 0.0
+    miner_daily_tao = emission_meta["miner_daily_tao"]
+    team_daily_tao_pct = (
+        round(100 * team_daily_tao / miner_daily_tao, 2) if miner_daily_tao else 0.0
+    )
     daily_registration_spend = _build_daily_registration_spend(rows)
     today_reg = daily_registration_spend["today"]
 
@@ -1237,6 +1270,7 @@ def fetch_registration_monitor_rows(
             "team_uids": len(team_rows),
             "total_emission": emission_meta["total_emission"],
             "total_daily_tao": total_daily_tao,
+            "miner_daily_tao": miner_daily_tao,
             "team_total_emission": team_total_emission,
             "team_daily_tao": team_daily_tao,
             "team_daily_tao_pct": team_daily_tao_pct,

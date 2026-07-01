@@ -153,6 +153,34 @@ def get_coldkeys_needing_transfer_pairs(db_path: Path = DEFAULT_DB) -> list[str]
     return sorted(stored - cached)
 
 
+def get_coldkeys_needing_transfer_pairs_from(db_path: Path, coldkeys: set[str]) -> list[str]:
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute("SELECT DISTINCT coldkey FROM coldkey_transfer_pairs").fetchall()
+    cached = {str(row["coldkey"]) for row in rows}
+    return sorted(coldkeys - cached)
+
+
+def get_transfer_pairs_between_coldkeys(db_path: Path, coldkeys: set[str]) -> list[dict]:
+    init_db(db_path)
+    if not coldkeys:
+        return []
+    keys = sorted(coldkeys)
+    placeholders = ",".join("?" * len(keys))
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM coldkey_transfer_pairs
+            WHERE counterparty != '__none__'
+              AND coldkey IN ({placeholders})
+              AND counterparty IN ({placeholders})
+            ORDER BY (in_count + out_count) DESC, coldkey ASC, counterparty ASC
+            """,
+            keys + keys,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_coldkey_transfer_pairs(db_path: Path = DEFAULT_DB) -> list[dict]:
     init_db(db_path)
     with _connect(db_path) as conn:
